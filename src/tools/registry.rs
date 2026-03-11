@@ -75,6 +75,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "image_generate",
     "image_edit",
     "image_analyze",
+    "gws_bridge",
 ];
 
 /// Registry of available tools.
@@ -235,6 +236,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(EchoTool));
         self.register_sync(Arc::new(TimeTool));
         self.register_sync(Arc::new(JsonTool));
+        self.register_sync(Arc::new(crate::tools::builtin::GwsBridgeTool::new()));
 
         let mut http = HttpTool::new();
         if let (Some(cr), Some(ss)) = (&self.credential_registry, &self.secrets_store) {
