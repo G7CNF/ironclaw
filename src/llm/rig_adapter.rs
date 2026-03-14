@@ -1387,14 +1387,14 @@ mod tests {
             .api_key("test-key")
             .base_url("http://localhost:0")
             .build()
-            .unwrap();
+            .unwrap(); // safety: test-only no-panics CI false positive
         let client = client.completions_api();
         let model = client.completion_model("qwen3.5:9b-q8_0");
         let adapter = RigAdapter::new(model, "qwen3.5:9b-q8_0")
             .with_ollama_base_url(Some("http://127.0.0.1:0".to_string()));
 
-        let models = adapter.list_models().await.unwrap();
+        let models = adapter.list_models().await.unwrap(); // safety: test-only no-panics CI false positive
 
-        assert_eq!(models, vec!["qwen3.5:9b-q8_0".to_string()]);
+        assert_eq!(models, vec!["qwen3.5:9b-q8_0".to_string()]); // safety: test-only no-panics CI false positive
     }
 }

@@ -371,7 +371,7 @@ mod tests {
             wasm_channel_owner_ids: HashMap::new(),
             telegram_polling_enabled: true,
         };
-        assert!(cfg.telegram_polling_enabled);
+        assert!(cfg.telegram_polling_enabled); // safety: test-only no-panics CI false positive
     }
 
     #[test]

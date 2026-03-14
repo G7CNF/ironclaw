@@ -1055,7 +1055,7 @@ mod tests {
             &caps_path,
             "test://url",
         )
-        .unwrap();
+        .unwrap(); // safety: test-only no-panics CI false positive
 
         assert!(wasm_path.exists());
         assert!(caps_path.exists());
@@ -1294,11 +1294,11 @@ mod tests {
             &caps_path,
             "test://url",
         )
-        .unwrap();
+        .unwrap(); // safety: test-only no-panics CI false positive
 
-        assert!(wasm_path.exists());
-        assert!(caps_path.exists());
-        assert!(result.has_capabilities);
+        assert!(wasm_path.exists()); // safety: test-only no-panics CI false positive
+        assert!(caps_path.exists()); // safety: test-only no-panics CI false positive
+        assert!(result.has_capabilities); // safety: test-only no-panics CI false positive
     }
 
     #[test]
@@ -1308,7 +1308,7 @@ mod tests {
             Some("telegram-tool.capabilities.json"),
         );
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap(); // safety: test-only no-panics CI false positive
         let wasm_path = tmp.path().join("telegram-mtproto.wasm");
         let caps_path = tmp.path().join("telegram-mtproto.capabilities.json");
 
@@ -1321,7 +1321,7 @@ mod tests {
             &caps_path,
             "test://url",
         )
-        .unwrap();
+        .unwrap(); // safety: test-only no-panics CI false positive
 
         assert!(wasm_path.exists());
         assert!(caps_path.exists());

@@ -537,31 +537,31 @@ mod tests {
 
     #[test]
     fn resolve_capabilities_path_prefers_local_sidecar() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap(); // safety: test-only no-panics CI false positive
         let wasm_path = dir.path().join("telegram.wasm");
         let cap_path = dir.path().join("telegram.capabilities.json");
-        std::fs::File::create(&wasm_path).unwrap();
-        std::fs::File::create(&cap_path).unwrap();
+        std::fs::File::create(&wasm_path).unwrap(); // safety: test-only no-panics CI false positive
+        std::fs::File::create(&cap_path).unwrap(); // safety: test-only no-panics CI false positive
 
         let resolved = super::resolve_capabilities_path("telegram", &wasm_path);
-        assert_eq!(resolved, Some(cap_path));
+        assert_eq!(resolved, Some(cap_path)); // safety: test-only no-panics CI false positive
     }
 
     #[test]
     fn resolve_capabilities_path_falls_back_to_bundled_sidecar() {
-        let install_dir = TempDir::new().unwrap();
-        let bundled_root = TempDir::new().unwrap();
+        let install_dir = TempDir::new().unwrap(); // safety: test-only no-panics CI false positive
+        let bundled_root = TempDir::new().unwrap(); // safety: test-only no-panics CI false positive
         let channel_dir = bundled_root.path().join("telegram");
         let target_dir = channel_dir.join(PathBuf::from("target/wasm32-wasip2/release"));
-        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap(); // safety: test-only no-panics CI false positive
 
         let installed_wasm = install_dir.path().join("telegram.wasm");
-        std::fs::File::create(&installed_wasm).unwrap();
+        std::fs::File::create(&installed_wasm).unwrap(); // safety: test-only no-panics CI false positive
 
         let bundled_wasm = target_dir.join("telegram_channel.wasm");
         let bundled_cap = channel_dir.join("telegram.capabilities.json");
-        std::fs::File::create(&bundled_wasm).unwrap();
-        std::fs::File::create(&bundled_cap).unwrap();
+        std::fs::File::create(&bundled_wasm).unwrap(); // safety: test-only no-panics CI false positive
+        std::fs::File::create(&bundled_cap).unwrap(); // safety: test-only no-panics CI false positive
 
         let previous = std::env::var_os("IRONCLAW_CHANNELS_SRC");
         unsafe {
@@ -579,6 +579,6 @@ mod tests {
             },
         }
 
-        assert_eq!(resolved, Some(bundled_cap));
+        assert_eq!(resolved, Some(bundled_cap)); // safety: test-only no-panics CI false positive
     }
 }

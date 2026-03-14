@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_locate_bundled_channel_capabilities_unknown_channel() {
-        assert!(locate_bundled_channel_capabilities("nonexistent").is_none());
+        assert!(locate_bundled_channel_capabilities("nonexistent").is_none()); // safety: test-only no-panics CI false positive
     }
 
     #[tokio::test]

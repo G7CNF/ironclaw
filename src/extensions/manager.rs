@@ -4531,7 +4531,7 @@ mod tests {
             wasm_header.set_cksum();
             builder
                 .append_data(&mut wasm_header, wasm_name, &wasm_data[..])
-                .expect("append wasm");
+                .expect("append wasm"); // safety: test-only no-panics CI false positive
 
             if let Some(caps_name) = caps_name {
                 let caps_data = br#"{"auth":null}"#;
@@ -4540,18 +4540,18 @@ mod tests {
                 caps_header.set_cksum();
                 builder
                     .append_data(&mut caps_header, caps_name, &caps_data[..])
-                    .expect("append caps");
+                    .expect("append caps"); // safety: test-only no-panics CI false positive
             }
 
-            builder.finish().expect("finish archive");
+            builder.finish().expect("finish archive"); // safety: test-only no-panics CI false positive
         }
 
-        encoder.finish().expect("finish gzip")
+        encoder.finish().expect("finish gzip") // safety: test-only no-panics CI false positive
     }
 
     #[test]
     fn test_extract_wasm_tar_gz_accepts_crate_named_bundle() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = tempfile::tempdir().expect("temp dir"); // safety: test-only no-panics CI false positive
         let mgr = make_test_manager(None, dir.path().to_path_buf());
         let archive = build_test_archive(
             "telegram_tool.wasm",
@@ -4567,10 +4567,10 @@ mod tests {
             &wasm_path,
             &caps_path,
         )
-        .expect("crate-named archive should install");
+        .expect("crate-named archive should install"); // safety: test-only no-panics CI false positive
 
-        assert!(wasm_path.exists());
-        assert!(caps_path.exists());
+        assert!(wasm_path.exists()); // safety: test-only no-panics CI false positive
+        assert!(caps_path.exists()); // safety: test-only no-panics CI false positive
     }
 
     // === QA Plan P2 - 2.4: Extension registry collision tests (filesystem) ===
