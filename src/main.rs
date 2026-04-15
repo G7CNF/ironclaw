@@ -15,8 +15,8 @@ use ironclaw::{
         web::log_layer::LogBroadcaster,
     },
     cli::{
-        Cli, Command, run_mcp_command, run_pairing_command, run_service_command,
-        run_status_command, run_tool_command,
+        Cli, Command, run_mcp_command, run_pairing_command, run_profile_command,
+        run_service_command, run_status_command, run_tool_command,
     },
     config::Config,
     hooks::bootstrap_hooks,
@@ -123,6 +123,10 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Pairing(pairing_cmd)) => {
             init_cli_tracing();
             return run_pairing_command(pairing_cmd.clone()).await;
+        }
+        Some(Command::Profile(profile_cmd)) => {
+            init_cli_tracing();
+            return run_profile_command(profile_cmd.clone()).await;
         }
         Some(Command::Service(service_cmd)) => {
             init_cli_tracing();
@@ -646,7 +650,7 @@ async fn async_main() -> anyhow::Result<()> {
         webhook_server_addr = Some(
             format!("{}:{}", host, port)
                 .parse()
-                .expect("HttpConfig host:port must be a valid SocketAddr"),
+                .map_err(|e| anyhow::anyhow!("invalid HttpConfig host:port: {e}"))?,
         );
         channel_names.push("http".to_string());
         channels.add(Box::new(http_channel)).await;
@@ -734,6 +738,9 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(ref gw_config) = config.channels.gateway {
         let mut gw = GatewayChannel::new(gw_config.clone(), config.owner_id.clone());
         gw = gw.with_llm_provider(Arc::clone(&components.llm));
+        if let Some(ref reload) = components.llm_reload {
+            gw = gw.with_llm_reload(Arc::clone(reload));
+        }
         if let Some(ref ws) = components.workspace {
             gw = gw.with_workspace(Arc::clone(ws));
         }
@@ -752,6 +759,7 @@ async fn async_main() -> anyhow::Result<()> {
             gw = gw.with_workspace_pool(pool);
         }
         gw = gw.with_session_manager(Arc::clone(&session_manager));
+        gw = gw.with_llm_session_manager(Arc::clone(&components.session));
         gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
         gw = gw.with_log_level_handle(Arc::clone(&log_level_handle));
         gw = gw.with_tool_registry(Arc::clone(&components.tools));
@@ -779,6 +787,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         if let Some(ref d) = components.db {
             gw = gw.with_store(Arc::clone(d));
+            if let Some(ref sc) = components.settings_cache {
+                gw = gw.with_settings_cache(Arc::clone(sc));
+            }
             gw = gw.with_db_auth(Arc::clone(d));
             let pairing_store = Arc::new(ironclaw::pairing::PairingStore::new(
                 Arc::clone(d),
@@ -850,7 +861,7 @@ async fn async_main() -> anyhow::Result<()> {
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
         gw = gw.with_oauth(config.oauth.clone(), gw_config.port);
         {
-            let active_model = components.llm.model_name().to_string();
+            let active_model = components.llm.active_model_name();
             let mut enabled = channel_names.clone();
             enabled.push("gateway".into());
             gw = gw.with_active_config(ironclaw::channels::web::server::ActiveConfigSnapshot {
@@ -859,6 +870,7 @@ async fn async_main() -> anyhow::Result<()> {
                 enabled_channels: enabled,
             });
         }
+        gw = gw.with_config_toml_path(toml_path.map(std::path::PathBuf::from));
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 
@@ -934,7 +946,7 @@ async fn async_main() -> anyhow::Result<()> {
     // ── Boot screen ────────────────────────────────────────────────────
 
     let boot_tool_count = components.tools.count();
-    let boot_llm_model = components.llm.model_name().to_string();
+    let boot_llm_model = components.llm.active_model_name();
     let boot_cheap_model = components
         .cheap_llm
         .as_ref()
@@ -1122,6 +1134,8 @@ async fn async_main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>)
         });
+    #[cfg(unix)]
+    let sighup_settings_cache = components.settings_cache.clone();
 
     let auth_manager = components.tools.secrets_store().cloned().map(|secrets| {
         Arc::new(ironclaw::bridge::auth_manager::AuthManager::new(
@@ -1134,6 +1148,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let deps = AgentDeps {
         owner_id: config.owner_id.clone(),
+        settings_store: components.settings_store.clone(),
         store: components.db,
         llm: components.llm,
         cheap_llm: components.cheap_llm,
@@ -1247,6 +1262,12 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 }
                 tracing::info!("SIGHUP received — reloading HTTP webhook config");
+
+                // Flush settings cache so direct DB edits are picked up.
+                if let Some(ref cache) = sighup_settings_cache {
+                    cache.flush().await;
+                    tracing::debug!("flushed settings cache");
+                }
 
                 // Inject channel secrets from database into thread-safe overlay
                 // (similar to inject_llm_keys_from_secrets for LLM providers)

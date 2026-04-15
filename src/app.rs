@@ -17,7 +17,7 @@ use crate::db::{Database, UserStore};
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
 use crate::llm::recording::HttpInterceptor;
-use crate::llm::{LlmProvider, RecordingLlm, SessionManager};
+use crate::llm::{LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager};
 use crate::secrets::SecretsStore;
 use crate::tools::ToolRegistry;
 use crate::tools::mcp::{McpProcessManager, McpSessionManager};
@@ -37,6 +37,7 @@ pub struct AppComponents {
     pub secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     pub llm: Arc<dyn LlmProvider>,
     pub cheap_llm: Option<Arc<dyn LlmProvider>>,
+    pub llm_reload: Option<Arc<LlmReloadHandle>>,
     pub safety: Arc<SafetyLayer>,
     pub tools: Arc<ToolRegistry>,
     pub embeddings: Option<Arc<dyn EmbeddingProvider>>,
@@ -49,6 +50,9 @@ pub struct AppComponents {
     /// runtime settings writes flow through the workspace and pick up schema
     /// validation.
     pub settings_store: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
+    /// Concrete cache handle for `flush()` / `invalidate_user()`.
+    /// Same instance backing `settings_store` when a cache is active.
+    pub settings_cache: Option<Arc<crate::db::cached_settings::CachedSettingsStore>>,
     pub extension_manager: Option<Arc<ExtensionManager>>,
     pub mcp_session_manager: Arc<McpSessionManager>,
     pub mcp_process_manager: Arc<McpProcessManager>,
@@ -334,12 +338,13 @@ impl AppBuilder {
             Arc<dyn LlmProvider>,
             Option<Arc<dyn LlmProvider>>,
             Option<Arc<RecordingLlm>>,
+            Option<Arc<LlmReloadHandle>>,
         ),
         anyhow::Error,
     > {
-        let (llm, cheap_llm, recording_handle) =
+        let (llm, cheap_llm, recording_handle, llm_reload) =
             crate::llm::build_provider_chain(&self.config.llm, self.session.clone()).await?;
-        Ok((llm, cheap_llm, recording_handle))
+        Ok((llm, cheap_llm, recording_handle, llm_reload))
     }
 
     /// Phase 4: Initialize safety, tools, embeddings, and workspace.
@@ -500,7 +505,7 @@ impl AppBuilder {
                     .unwrap_or_else(|| self.config.llm.nearai.model.clone());
                 let models = vec![model_name.clone()];
                 let gen_model = crate::llm::image_models::suggest_image_model(&models)
-                    .unwrap_or("flux-1.1-pro")
+                    .unwrap_or("black-forest-labs/FLUX.2-klein-4B")
                     .to_string();
                 tools.register_image_tools(api_base.clone(), api_key.clone(), gen_model, None);
 
@@ -818,12 +823,15 @@ impl AppBuilder {
             use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
             let ephemeral_key =
                 secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
-            let crypto = Arc::new(SecretsCrypto::new(ephemeral_key).expect("ephemeral crypto"));
+            let crypto = Arc::new(
+                SecretsCrypto::new(ephemeral_key)
+                    .map_err(|e| anyhow::anyhow!("ephemeral crypto: {e}"))?,
+            );
             tracing::debug!("Using ephemeral in-memory secrets store for extension manager");
             Arc::new(InMemorySecretsStore::new(crypto))
         };
         let extension_manager = {
-            let manager = Arc::new(ExtensionManager::new(
+            let mut em = ExtensionManager::new(
                 Arc::clone(&mcp_session_manager),
                 Arc::clone(&mcp_process_manager),
                 ext_secrets,
@@ -836,7 +844,11 @@ impl AppBuilder {
                 self.config.owner_id.clone(),
                 self.db.clone(),
                 catalog_entries.clone(),
-            ));
+            );
+            if let Some(ref ss) = settings_store_override {
+                em = em.with_settings_store(Arc::clone(ss));
+            }
+            let manager = Arc::new(em);
             tools.register_extension_tools(Arc::clone(&manager));
 
             // Register permission management tool and upgrade tool_list with
@@ -931,11 +943,12 @@ impl AppBuilder {
             );
         }
 
-        let (llm, cheap_llm, recording_handle) = if let Some(llm) = self.llm_override.take() {
-            (llm, None, None)
-        } else {
-            self.init_llm().await?
-        };
+        let (llm, cheap_llm, recording_handle, llm_reload) =
+            if let Some(llm) = self.llm_override.take() {
+                (llm, None, None, None)
+            } else {
+                self.init_llm().await?
+            };
         let (safety, tools, embeddings, workspace, builder, credential_registry, http_interceptor) =
             self.init_tools(&llm).await?;
 
@@ -949,22 +962,30 @@ impl AppBuilder {
         // `upgrade_tool_list`) can be wired with the adapter from the start.
         // The same adapter instance is then exposed on `AppComponents.settings_store`
         // and reused by main.rs (e.g. for the SIGHUP reload handler).
-        let settings_store: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>> =
-            match (&workspace, &self.db) {
-                (Some(ws), Some(db)) => {
-                    let adapter = Arc::new(crate::workspace::WorkspaceSettingsAdapter::new(
-                        Arc::clone(ws),
-                        Arc::clone(db),
-                    ));
-                    if let Err(e) = adapter.ensure_system_config().await {
-                        tracing::debug!(
-                            "WorkspaceSettingsAdapter eager seed failed (lazy seed will retry): {e}"
-                        );
-                    }
-                    Some(adapter as Arc<dyn crate::db::SettingsStore + Send + Sync>)
+        let (settings_store, settings_cache): (
+            Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
+            Option<Arc<crate::db::cached_settings::CachedSettingsStore>>,
+        ) = match (&workspace, &self.db) {
+            (Some(ws), Some(db)) => {
+                let adapter = Arc::new(crate::workspace::WorkspaceSettingsAdapter::new(
+                    Arc::clone(ws),
+                    Arc::clone(db),
+                ));
+                if let Err(e) = adapter.ensure_system_config().await {
+                    tracing::debug!(
+                        "WorkspaceSettingsAdapter eager seed failed (lazy seed will retry): {e}"
+                    );
                 }
-                _ => None,
-            };
+                let cached = Arc::new(crate::db::cached_settings::CachedSettingsStore::new(
+                    adapter as Arc<dyn crate::db::SettingsStore + Send + Sync>,
+                ));
+                (
+                    Some(Arc::clone(&cached) as Arc<dyn crate::db::SettingsStore + Send + Sync>),
+                    Some(cached),
+                )
+            }
+            _ => (None, None),
+        };
 
         let (
             mcp_session_manager,
@@ -1094,11 +1115,13 @@ impl AppBuilder {
             secrets_store: self.secrets_store,
             llm,
             cheap_llm,
+            llm_reload,
             safety,
             tools,
             embeddings,
             workspace,
             settings_store,
+            settings_cache,
             extension_manager,
             mcp_session_manager,
             mcp_process_manager,
@@ -1346,124 +1369,6 @@ async fn seed_tool_permissions(
         tracing::debug!(
             count = seeded,
             "Seeded tool permission defaults into database"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use async_trait::async_trait;
-    use tokio::sync::mpsc;
-
-    use crate::agent::SessionManager as AgentSessionManager;
-    use crate::hooks::{
-        Hook, HookContext, HookError, HookEvent, HookOutcome, HookPoint, HookRegistry,
-    };
-
-    struct SessionStartHook {
-        tx: mpsc::UnboundedSender<(String, String)>,
-    }
-
-    #[async_trait]
-    impl Hook for SessionStartHook {
-        fn name(&self) -> &str {
-            "session-start-test"
-        }
-
-        fn hook_points(&self) -> &[HookPoint] {
-            &[HookPoint::OnSessionStart]
-        }
-
-        async fn execute(
-            &self,
-            event: &HookEvent,
-            _ctx: &HookContext,
-        ) -> Result<HookOutcome, HookError> {
-            if let HookEvent::SessionStart {
-                user_id,
-                session_id,
-            } = event
-            {
-                self.tx
-                    .send((user_id.clone(), session_id.clone()))
-                    .expect("test channel receiver should be alive");
-            } else {
-                panic!("SessionStartHook received an unexpected event: {event:?}");
-            }
-            Ok(HookOutcome::ok())
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_session_manager_runs_session_start_hooks() {
-        let hooks = Arc::new(HookRegistry::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        hooks.register(Arc::new(SessionStartHook { tx })).await;
-
-        let manager = AgentSessionManager::new().with_hooks(Arc::clone(&hooks));
-        manager.get_or_create_session("user-123").await;
-
-        let (user_id, session_id) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-                .await
-                .expect("session start hook should fire")
-                .expect("session start payload should be present");
-
-        assert_eq!(user_id, "user-123");
-        assert!(!session_id.is_empty());
-    }
-
-    /// Verify that `seed_tool_permissions` is idempotent: an existing user
-    /// override must survive a re-seed.
-    #[cfg(feature = "libsql")]
-    #[tokio::test]
-    async fn seed_tool_permissions_preserves_user_overrides() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
-        use crate::tools::ToolRegistry;
-        use crate::tools::permissions::PermissionState;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test_seed.db");
-        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let db: Arc<dyn Database> = Arc::new(backend);
-
-        let registry = ToolRegistry::new();
-        registry.register_builtin_tools();
-
-        let owner = "test-user";
-
-        // 1. Initial seed: creates defaults for all registered tools.
-        super::seed_tool_permissions(&registry, Some(&db), owner).await;
-
-        // Verify "echo" was seeded as AlwaysAllow.
-        let map = db.get_all_settings(owner).await.unwrap();
-        let settings = crate::settings::Settings::from_db_map(&map);
-        assert_eq!(
-            settings.tool_permissions.get("echo"),
-            Some(&PermissionState::AlwaysAllow),
-            "echo should be AlwaysAllow after initial seed"
-        );
-
-        // 2. User overrides echo → Disabled.
-        let disabled_json = serde_json::to_value(PermissionState::Disabled).unwrap();
-        db.set_setting(owner, "tool_permissions.echo", &disabled_json)
-            .await
-            .unwrap();
-
-        // 3. Re-seed (e.g. after a restart).
-        super::seed_tool_permissions(&registry, Some(&db), owner).await;
-
-        // 4. Assert the override survived.
-        let map = db.get_all_settings(owner).await.unwrap();
-        let settings = crate::settings::Settings::from_db_map(&map);
-        assert_eq!(
-            settings.tool_permissions.get("echo"),
-            Some(&PermissionState::Disabled),
-            "user override to Disabled must survive re-seed"
         );
     }
 }

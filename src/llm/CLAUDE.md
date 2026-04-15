@@ -26,6 +26,7 @@ Multi-provider LLM integration with circuit breaker, retry, failover, and respon
 | `rig_adapter.rs` | Adapter bridging rig-core `CompletionModel` → `LlmProvider`; used by OpenAI, Anthropic, Ollama, Tinfoil |
 | `smart_routing.rs` | `SmartRoutingProvider` — 13-dimension complexity scorer routes cheap vs primary model |
 | `recording.rs` | `RecordingLlm` — trace capture for E2E replay testing (`IRONCLAW_RECORD_TRACE`) |
+| `runtime.rs` | `SwappableLlmProvider` and `LlmReloadHandle` for live provider-chain reloads |
 | `bedrock.rs` | AWS Bedrock provider via native Converse API (feature-gated: `--features bedrock`) |
 
 ## Provider Selection
@@ -109,7 +110,7 @@ Closed (normal)
 
 **Transient vs non-transient errors:** Only `RequestFailed`, `RateLimited`, `InvalidResponse`, `SessionExpired`, `SessionRenewalFailed`, `Http`, and `Io` count toward the threshold. `AuthFailed`, `ContextLengthExceeded`, `ModelNotAvailable`, and `Json` errors never trip the breaker — they indicate caller problems, not backend degradation.
 
-Configure via `NearAiConfig` fields: `circuit_breaker_threshold` (None = disabled), `circuit_breaker_recovery_secs` (default: 30).
+Configure via `LlmConfig` fields: `circuit_breaker_threshold` (env: `LLM_CIRCUIT_BREAKER_THRESHOLD`, falls back to `CIRCUIT_BREAKER_THRESHOLD`; None = disabled), `circuit_breaker_recovery_secs` (env: `LLM_CIRCUIT_BREAKER_RECOVERY_SECS`; default: 30).
 
 The circuit breaker wraps the entire provider chain. When open, it immediately returns `LlmError::RequestFailed` with a message including remaining cooldown seconds. The `FailoverProvider` sitting outside can then try a fallback model.
 
@@ -127,7 +128,7 @@ The circuit breaker wraps the entire provider chain. When open, it immediately r
 
 **Backoff schedule:** base 1s doubled per attempt with ±25% jitter, minimum floor 100ms. Attempt 0: ~1s, attempt 1: ~2s, attempt 2: ~4s. For `RateLimited`, uses the `retry_after` duration from the error (provider-supplied) instead of backoff.
 
-Configure via `NearAiConfig.max_retries` (env: `NEARAI_MAX_RETRIES`; default: 3). Set to 0 to disable.
+Configure via `LlmConfig.max_retries` (env: `LLM_MAX_RETRIES`, falls back to `NEARAI_MAX_RETRIES`; default: 3). Set to 0 to disable.
 
 ## LlmProvider Trait
 
@@ -168,7 +169,7 @@ To add a new provider:
 
 `CachedProvider` in `response_cache.rs` caches `complete()` responses. `complete_with_tools()` is never cached (side effects). Cache key is SHA-256 of `(model_name, messages_json, max_tokens, temperature, stop_sequences)`. LRU eviction when `max_entries` is reached; TTL-based expiry on access.
 
-**Defaults:** TTL = 1 hour, max entries = 1000. Configure via `NearAiConfig` fields: `response_cache_enabled` (env: `NEARAI_RESPONSE_CACHE_ENABLED`), `response_cache_ttl_secs`, `response_cache_max_entries`. Cache is in-memory only — evicted on restart.
+**Defaults:** TTL = 1 hour, max entries = 1000. Configure via `LlmConfig` fields: `response_cache_enabled` (env: `LLM_RESPONSE_CACHE_ENABLED`, falls back to `RESPONSE_CACHE_ENABLED`), `response_cache_ttl_secs` (env: `LLM_RESPONSE_CACHE_TTL_SECS`), `response_cache_max_entries` (env: `LLM_RESPONSE_CACHE_MAX_ENTRIES`). Cache is in-memory only — evicted on restart.
 
 ## OpenAI-Compatible Custom Headers
 
@@ -201,12 +202,26 @@ Raw provider
   → RetryProvider           (per-provider backoff; wraps both primary and fallback)
   → SmartRoutingProvider    (cheap/primary split when NEARAI_CHEAP_MODEL is set)
   → FailoverProvider        (fallback model; only when NEARAI_FALLBACK_MODEL is set)
-  → CircuitBreakerProvider  (fast-fail; only when NEARAI_CIRCUIT_BREAKER_THRESHOLD is set)
-  → CachedProvider          (response cache; only when NEARAI_RESPONSE_CACHE_ENABLED=true)
+  → CircuitBreakerProvider  (fast-fail; only when LLM_CIRCUIT_BREAKER_THRESHOLD is set)
+  → CachedProvider          (response cache; only when LLM_RESPONSE_CACHE_ENABLED=true)
   → RecordingLlm            (trace capture; only when IRONCLAW_RECORD_TRACE is set)
 ```
 
 `build_provider_chain()` also returns a separate standalone cheap LLM provider (for heartbeat/evaluation tasks — not part of the decorator chain).
+
+## Runtime Hot Reload
+
+`runtime.rs` keeps the public `Arc<dyn LlmProvider>` stable while letting the
+inner provider chain be replaced when LLM settings change. The gateway's web
+settings handlers call the reload handle after persisting backend/model changes,
+so switching `llm_backend`, `selected_model`, or provider-specific model/URL
+settings can take effect without restarting the daemon when the reload handle
+is wired in.
+
+Key points:
+- `SwappableLlmProvider` caches model metadata while delegating requests to the current inner chain.
+- `LlmReloadHandle::reload()` rebuilds the raw provider chain from config and swaps the live providers in place.
+- `RecordingLlm` still wraps the swappable primary provider, so trace capture continues to follow the live backend.
 
 ## reasoning.rs Contents
 

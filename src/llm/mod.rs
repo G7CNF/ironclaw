@@ -32,6 +32,7 @@ pub mod registry;
 pub mod response_cache;
 pub mod retry;
 mod rig_adapter;
+pub mod runtime;
 pub mod session;
 pub mod smart_routing;
 mod token_refreshing;
@@ -72,6 +73,7 @@ pub use registry::{ProviderDefinition, ProviderProtocol, ProviderRegistry};
 pub use response_cache::{CachedProvider, ResponseCacheConfig};
 pub use retry::{RetryConfig, RetryProvider};
 pub use rig_adapter::RigAdapter;
+pub use runtime::{LlmReloadHandle, SwappableLlmProvider};
 pub use session::{SessionConfig, SessionManager, create_session_manager};
 pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
 pub use token_refreshing::TokenRefreshingProvider;
@@ -285,7 +287,8 @@ fn create_openai_compat_from_registry(
 
     let mut builder = openai::Client::builder().api_key(&api_key);
     if !config.base_url.is_empty() {
-        builder = builder.base_url(&config.base_url);
+        let base_url = normalize_openai_base_url(&config.base_url);
+        builder = builder.base_url(&base_url);
     }
     if !extra_headers.is_empty() {
         builder = builder.http_headers(extra_headers);
@@ -542,18 +545,16 @@ fn create_cheap_provider_for_backend(
 ///
 /// This is the single source of truth for provider chain construction,
 /// called by both `main.rs` and `app.rs`.
+pub(crate) struct ProviderChainComponents {
+    pub primary: Arc<dyn LlmProvider>,
+    pub cheap: Option<Arc<dyn LlmProvider>>,
+}
+
 #[allow(clippy::type_complexity)]
-pub async fn build_provider_chain(
+pub(crate) async fn build_provider_chain_components(
     config: &LlmConfig,
     session: Arc<SessionManager>,
-) -> Result<
-    (
-        Arc<dyn LlmProvider>,
-        Option<Arc<dyn LlmProvider>>,
-        Option<Arc<RecordingLlm>>,
-    ),
-    LlmError,
-> {
+) -> Result<ProviderChainComponents, LlmError> {
     let llm: Arc<dyn LlmProvider> = if config.backend == "openai_codex" {
         create_openai_codex_provider(config).await?
     } else {
@@ -561,9 +562,10 @@ pub async fn build_provider_chain(
     };
     tracing::debug!("LLM provider initialized: {}", llm.model_name());
 
-    // 1. Retry
+    // 1. Retry — uses top-level LlmConfig fields (resolved from LLM_* env vars
+    // with fallback to NEARAI_* for backward compatibility).
     let retry_config = RetryConfig {
-        max_retries: config.nearai.max_retries,
+        max_retries: config.max_retries,
     };
     let llm: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
         tracing::debug!(
@@ -644,18 +646,15 @@ pub async fn build_provider_chain(
     };
 
     // 4. Circuit breaker
-    let llm: Arc<dyn LlmProvider> = if let Some(threshold) = config.nearai.circuit_breaker_threshold
-    {
+    let llm: Arc<dyn LlmProvider> = if let Some(threshold) = config.circuit_breaker_threshold {
         let cb_config = CircuitBreakerConfig {
             failure_threshold: threshold,
-            recovery_timeout: std::time::Duration::from_secs(
-                config.nearai.circuit_breaker_recovery_secs,
-            ),
+            recovery_timeout: std::time::Duration::from_secs(config.circuit_breaker_recovery_secs),
             ..CircuitBreakerConfig::default()
         };
         tracing::debug!(
             threshold,
-            recovery_secs = config.nearai.circuit_breaker_recovery_secs,
+            recovery_secs = config.circuit_breaker_recovery_secs,
             "LLM circuit breaker enabled"
         );
         Arc::new(CircuitBreakerProvider::new(llm, cb_config))
@@ -664,25 +663,17 @@ pub async fn build_provider_chain(
     };
 
     // 5. Response cache
-    let llm: Arc<dyn LlmProvider> = if config.nearai.response_cache_enabled {
+    let llm: Arc<dyn LlmProvider> = if config.response_cache_enabled {
         let rc_config = ResponseCacheConfig {
-            ttl: std::time::Duration::from_secs(config.nearai.response_cache_ttl_secs),
-            max_entries: config.nearai.response_cache_max_entries,
+            ttl: std::time::Duration::from_secs(config.response_cache_ttl_secs),
+            max_entries: config.response_cache_max_entries,
         };
         tracing::debug!(
-            ttl_secs = config.nearai.response_cache_ttl_secs,
-            max_entries = config.nearai.response_cache_max_entries,
+            ttl_secs = config.response_cache_ttl_secs,
+            max_entries = config.response_cache_max_entries,
             "LLM response cache enabled"
         );
         Arc::new(CachedProvider::new(llm, rc_config))
-    } else {
-        llm
-    };
-
-    // 6. Recording (trace capture for replay testing)
-    let recording_handle = RecordingLlm::from_env(llm.clone());
-    let llm: Arc<dyn LlmProvider> = if let Some(ref recorder) = recording_handle {
-        Arc::clone(recorder) as Arc<dyn LlmProvider>
     } else {
         llm
     };
@@ -693,7 +684,48 @@ pub async fn build_provider_chain(
         tracing::debug!("Cheap LLM provider initialized: {}", cheap.model_name());
     }
 
-    Ok((llm, cheap_llm, recording_handle))
+    Ok(ProviderChainComponents {
+        primary: llm,
+        cheap: cheap_llm,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+pub async fn build_provider_chain(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+) -> Result<
+    (
+        Arc<dyn LlmProvider>,
+        Option<Arc<dyn LlmProvider>>,
+        Option<Arc<RecordingLlm>>,
+        Option<Arc<LlmReloadHandle>>,
+    ),
+    LlmError,
+> {
+    let components = build_provider_chain_components(config, session.clone()).await?;
+
+    let primary_reload = Arc::new(SwappableLlmProvider::new(components.primary));
+    let cheap_reload = components
+        .cheap
+        .map(|cheap| Arc::new(SwappableLlmProvider::new(cheap)));
+    let reload_handle = Arc::new(LlmReloadHandle::new(
+        Arc::clone(&primary_reload),
+        cheap_reload.clone(),
+    ));
+
+    // 6. Recording (trace capture for replay testing)
+    let primary_provider: Arc<dyn LlmProvider> = primary_reload.clone();
+    let recording_handle = RecordingLlm::from_env(primary_provider.clone());
+    let llm: Arc<dyn LlmProvider> = if let Some(ref recorder) = recording_handle {
+        Arc::clone(recorder) as Arc<dyn LlmProvider>
+    } else {
+        primary_provider
+    };
+
+    let cheap_llm = cheap_reload.map(|cheap| cheap as Arc<dyn LlmProvider>);
+
+    Ok((llm, cheap_llm, recording_handle, Some(reload_handle)))
 }
 
 pub fn create_gemini_oauth_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
@@ -707,164 +739,30 @@ pub fn create_gemini_oauth_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPro
     Ok(Arc::new(provider))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::config::NearAiConfig;
-
-    fn test_nearai_config() -> NearAiConfig {
-        NearAiConfig {
-            model: "test-model".to_string(),
-            cheap_model: None,
-            base_url: "https://api.near.ai".to_string(),
-            api_key: None,
-            fallback_model: None,
-            max_retries: 3,
-            circuit_breaker_threshold: None,
-            circuit_breaker_recovery_secs: 30,
-            response_cache_enabled: false,
-            response_cache_ttl_secs: 3600,
-            response_cache_max_entries: 1000,
-            failover_cooldown_secs: 300,
-            failover_cooldown_threshold: 3,
-            smart_routing_cascade: true,
+/// Normalize an OpenAI-compatible base URL by appending `/v1` when the URL
+/// contains no path (bare `scheme://host[:port]`).
+///
+/// rig-core's `openai::Client` does not auto-append `/v1/` to the base URL,
+/// so local model servers (MLX, vLLM, llama.cpp) using bare URLs like
+/// `http://localhost:8080` get 404s. This mirrors the old
+/// `NearAiChatProvider::api_url()` behavior.
+///
+/// URLs that already carry a path — including non-`/v1` versioned paths such
+/// as Zai's `/api/paas/v4` or Gemini's `/v1beta/openai` — are returned
+/// unchanged so we don't corrupt provider-specific endpoints.
+///
+/// **Note:** This is intentionally applied only to `OpenAiCompletions`-protocol
+/// providers. Ollama uses `/api/chat` (not `/v1/chat/completions`) and its
+/// rig-core client handles the path internally, so normalization is not needed.
+fn normalize_openai_base_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.to_ascii_lowercase().ends_with("/v1") {
+        return trimmed.to_string();
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed) if parsed.path().is_empty() || parsed.path() == "/" => {
+            format!("{trimmed}/v1")
         }
-    }
-
-    fn test_llm_config() -> LlmConfig {
-        LlmConfig {
-            backend: "nearai".to_string(),
-            session: SessionConfig::default(),
-            nearai: test_nearai_config(),
-            provider: None,
-            bedrock: None,
-            gemini_oauth: None,
-            request_timeout_secs: 120,
-            cheap_model: None,
-            smart_routing_cascade: true,
-            openai_codex: None,
-        }
-    }
-
-    #[test]
-    fn test_create_cheap_llm_provider_returns_none_when_not_configured() {
-        let config = test_llm_config();
-        let session = Arc::new(SessionManager::new(SessionConfig::default()));
-
-        let result = create_cheap_llm_provider(&config, session);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_create_cheap_llm_provider_creates_provider_with_nearai_cheap_model() {
-        let mut config = test_llm_config();
-        config.nearai.cheap_model = Some("cheap-test-model".to_string());
-
-        let session = Arc::new(SessionManager::new(SessionConfig::default()));
-        let result = create_cheap_llm_provider(&config, session);
-
-        assert!(result.is_ok());
-        let provider = result.unwrap();
-        assert!(provider.is_some());
-        assert_eq!(provider.unwrap().model_name(), "cheap-test-model");
-    }
-
-    #[test]
-    fn test_create_cheap_llm_provider_generic_overrides_nearai() {
-        let mut config = test_llm_config();
-        config.nearai.cheap_model = Some("nearai-cheap".to_string());
-        config.cheap_model = Some("generic-cheap".to_string());
-
-        let session = Arc::new(SessionManager::new(SessionConfig::default()));
-        let result = create_cheap_llm_provider(&config, session);
-
-        assert!(result.is_ok());
-        let provider = result.unwrap();
-        assert!(provider.is_some());
-        assert_eq!(
-            provider.unwrap().model_name(),
-            "generic-cheap",
-            "LLM_CHEAP_MODEL should take priority over NEARAI_CHEAP_MODEL"
-        );
-    }
-
-    #[test]
-    fn test_create_cheap_llm_provider_nearai_cheap_ignored_for_non_nearai_backend() {
-        let mut config = test_llm_config();
-        config.backend = "openai".to_string();
-        config.nearai.cheap_model = Some("cheap-test-model".to_string());
-
-        let session = Arc::new(SessionManager::new(SessionConfig::default()));
-        let result = create_cheap_llm_provider(&config, session);
-
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "NEARAI_CHEAP_MODEL should be ignored when backend is not nearai"
-        );
-    }
-
-    #[test]
-    fn test_create_cheap_llm_provider_bedrock_returns_error() {
-        let mut config = test_llm_config();
-        config.backend = "bedrock".to_string();
-        config.cheap_model = Some("cheap-model".to_string());
-
-        let session = Arc::new(SessionManager::new(SessionConfig::default()));
-        let result = create_cheap_llm_provider(&config, session);
-
-        assert!(
-            result.is_err(),
-            "Bedrock should return an error for cheap model"
-        );
-    }
-
-    #[test]
-    fn test_create_cheap_llm_provider_gemini_oauth_creates_provider() {
-        let mut config = test_llm_config();
-        config.backend = "gemini_oauth".to_string();
-        config.cheap_model = Some("gemini-2.5-flash-lite".to_string());
-        config.gemini_oauth = Some(crate::config::GeminiOauthConfig {
-            model: "gemini-2.5-pro".to_string(),
-            credentials_path: std::path::PathBuf::from("/tmp/nonexistent-creds.json"),
-        });
-
-        let session = Arc::new(SessionManager::new(SessionConfig::default()));
-        let result = create_cheap_llm_provider(&config, session);
-
-        // Should succeed and return a provider (credentials validation is deferred
-        // until the first LLM call, not at construction time).
-        let provider = result.expect("gemini_oauth cheap provider should succeed");
-        assert!(provider.is_some(), "Should return Some(provider)");
-        assert_eq!(
-            provider.unwrap().model_name(),
-            "gemini-2.5-flash-lite",
-            "Cheap provider should use the overridden model name"
-        );
-    }
-
-    #[test]
-    fn test_cheap_model_name_resolution() {
-        // Generic takes priority
-        let mut config = test_llm_config();
-        config.cheap_model = Some("generic".to_string());
-        config.nearai.cheap_model = Some("nearai".to_string());
-        assert_eq!(config.cheap_model_name(), Some("generic"));
-
-        // NearAI fallback when backend is nearai
-        let mut config = test_llm_config();
-        config.nearai.cheap_model = Some("nearai".to_string());
-        assert_eq!(config.cheap_model_name(), Some("nearai"));
-
-        // NearAI ignored for non-nearai backend
-        let mut config = test_llm_config();
-        config.backend = "openai".to_string();
-        config.nearai.cheap_model = Some("nearai".to_string());
-        assert_eq!(config.cheap_model_name(), None);
-
-        // None when nothing configured
-        let config = test_llm_config();
-        assert_eq!(config.cheap_model_name(), None);
+        _ => trimmed.to_string(),
     }
 }

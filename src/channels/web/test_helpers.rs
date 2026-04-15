@@ -69,17 +69,20 @@ impl TestGatewayBuilder {
             workspace: None,
             workspace_pool: None,
             session_manager: None,
+            llm_session_manager: None,
             log_broadcaster: None,
             log_level_handle: None,
             extension_manager: None,
             tool_registry: None,
             store: None,
+            settings_cache: None,
             job_manager: None,
             prompt_queue: None,
             owner_id: self.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             llm_provider: self.llm_provider,
+            llm_reload: None,
             skill_registry: None,
             skill_catalog: None,
             auth_manager: None,
@@ -90,8 +93,11 @@ impl TestGatewayBuilder {
             registry_entries: Vec::new(),
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            config_toml_path: None,
             startup_time: std::time::Instant::now(),
-            active_config: crate::channels::web::server::ActiveConfigSnapshot::default(),
+            active_config: Arc::new(tokio::sync::RwLock::new(
+                crate::channels::web::server::ActiveConfigSnapshot::default(),
+            )),
             secrets_store: None,
             db_auth: None,
             pairing_store: None,
@@ -116,9 +122,7 @@ impl TestGatewayBuilder {
     ) -> Result<(SocketAddr, Arc<GatewayState>), crate::error::ChannelError> {
         let auth = MultiAuthState::single(auth_token.to_string(), "test-user".to_string());
         let state = self.build();
-        let addr: SocketAddr = "127.0.0.1:0"
-            .parse()
-            .expect("hard-coded address must parse"); // safety: constant literal
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 0));
         let bound = start_server(addr, state.clone(), auth.into()).await?;
         Ok((bound, state))
     }
@@ -130,9 +134,7 @@ impl TestGatewayBuilder {
         auth: MultiAuthState,
     ) -> Result<(SocketAddr, Arc<GatewayState>), crate::error::ChannelError> {
         let state = self.build();
-        let addr: SocketAddr = "127.0.0.1:0"
-            .parse()
-            .expect("hard-coded address must parse"); // safety: constant literal
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 0));
         let bound = start_server(addr, state.clone(), auth.into()).await?;
         Ok((bound, state))
     }

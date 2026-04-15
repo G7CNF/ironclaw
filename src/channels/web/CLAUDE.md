@@ -107,6 +107,7 @@ Extension lifecycle note:
 | POST | `/api/admin/users/{id}/suspend` | Suspend a user |
 | POST | `/api/admin/users/{id}/activate` | Re-activate a user |
 | GET | `/api/admin/usage` | Per-user LLM usage stats |
+| GET | `/api/admin/usage/summary` | System-wide usage summary for the admin dashboard |
 | GET | `/api/admin/users/{user_id}/secrets` | List a user's secrets (names only) |
 | PUT | `/api/admin/users/{user_id}/secrets/{name}` | Create or update a user's secret |
 | DELETE | `/api/admin/users/{user_id}/secrets/{name}` | Delete a user's secret |
@@ -149,6 +150,7 @@ Extension lifecycle note:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Single-page app HTML |
+| GET | `/theme.css` | Shared theme tokens for the web and admin SPAs |
 | GET | `/style.css` | App stylesheet |
 | GET | `/app.js` | App JavaScript |
 | GET | `/favicon.ico` | Favicon (cached 1 day) |
@@ -214,6 +216,8 @@ Key fields:
 - `cost_guard` — `Option<Arc<CostGuard>>` — exposes token usage / cost totals in the status endpoint.
 - `startup_time` — `Instant` — used to compute uptime in the gateway status response.
 - `registry_entries` — `Vec<RegistryEntry>` — loaded once at startup from registry manifests; used by the available extensions API without hitting the network.
+- `llm_reload` / `llm_session_manager` — optional live-reload handles for rebuilding the active LLM provider chain after settings changes.
+- `active_config` — `Arc<RwLock<ActiveConfigSnapshot>>` so gateway status can reflect live provider/model changes without rebuilding the whole state tree.
 
 Subsystems are wired via `with_*` builder methods on `GatewayChannel` (`mod.rs`). Each call rebuilds `Arc<GatewayState>` — safe to call before `start()`, not after.
 
@@ -221,7 +225,7 @@ Subsystems are wired via `with_*` builder methods on `GatewayChannel` (`mod.rs`)
 
 Both SSE and WebSocket share the same `SseManager` broadcast channel. Key characteristics:
 
-- **Broadcast buffer:** 256 events. A slow client that falls behind will miss events — the `BroadcastStream` silently drops lagged events. SSE clients are expected to reconnect and re-fetch history.
+- **Broadcast buffer:** `SSE_BROADCAST_BUFFER` env var (default `1024`, clamped to 65,536 max). A slow client that falls behind will miss events — the `BroadcastStream` silently drops lagged events. SSE clients are expected to reconnect and re-fetch history.
 - **Max connections:** `GATEWAY_MAX_CONNECTIONS` (default `100`) total across SSE + WebSocket. Connections beyond the limit receive a 503 / are immediately dropped.
 - **SSE keepalive:** Axum's `KeepAlive` sends an empty event every **30 seconds** to prevent proxy timeouts.
 - **WebSocket:** Two tasks per connection — a sender task (broadcast → WS frames) and a receiver loop (WS frames → agent). When the client disconnects, the sender is aborted and both the SSE connection counter and WS tracker counter are decremented.
@@ -247,3 +251,14 @@ Classic agent approvals are in-memory, but engine v2 pauses live in the unified 
 3. Register the route in `start_server()` in `server.rs` under the correct router (`public`, `protected`, or `statics`).
 4. If it is an SSE or WebSocket endpoint, add its path to `allows_query_token_auth()` in `auth.rs`.
 5. If it requires a new `GatewayState` field, add it to the struct and to both the `GatewayChannel::new()` initializer and `rebuild_state()` in `mod.rs`, then add a `with_*` builder method.
+
+## Settings Hot Reload
+
+LLM-related settings updates handled by the gateway settings handlers now
+trigger a provider-chain reload when the gateway was built with the reload
+handle. In practice this means changing `llm_backend`, `selected_model`, or a
+provider-specific base URL/model field from the web UI can update the active
+daemon without requiring a Docker-only restart path.
+
+If the gateway was started without a reload handle, settings are still persisted
+as before; the new values apply on the next process start.

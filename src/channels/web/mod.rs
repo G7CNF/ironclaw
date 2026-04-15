@@ -134,15 +134,20 @@ impl GatewayChannel {
 
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: Arc::new(SseManager::with_max_connections(config.max_connections)),
+            sse: Arc::new(SseManager::with_max_connections_and_buffer(
+                config.max_connections,
+                config.broadcast_buffer,
+            )),
             workspace: None,
             workspace_pool: None,
             session_manager: None,
+            llm_session_manager: None,
             log_broadcaster: None,
             log_level_handle: None,
             extension_manager: None,
             tool_registry: None,
             store: None,
+            settings_cache: None,
             job_manager: None,
             prompt_queue: None,
             scheduler: None,
@@ -150,6 +155,7 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
+            llm_reload: None,
             skill_registry: None,
             skill_catalog: None,
             auth_manager: None,
@@ -159,8 +165,11 @@ impl GatewayChannel {
             registry_entries: Vec::new(),
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            config_toml_path: None,
             startup_time: std::time::Instant::now(),
-            active_config: server::ActiveConfigSnapshot::default(),
+            active_config: Arc::new(tokio::sync::RwLock::new(
+                server::ActiveConfigSnapshot::default(),
+            )),
             secrets_store: None,
             db_auth: None,
             pairing_store: None,
@@ -188,6 +197,8 @@ impl GatewayChannel {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             // Preserve the existing broadcast channel so sender handles remain valid.
+            // The broadcast channel capacity is already baked into `tx` at
+            // creation time; `from_sender` cannot resize it.
             sse: Arc::new(SseManager::from_sender(
                 self.state.sse.sender(),
                 self.state.sse.max_connections(),
@@ -195,11 +206,13 @@ impl GatewayChannel {
             workspace: self.state.workspace.clone(),
             workspace_pool: self.state.workspace_pool.clone(),
             session_manager: self.state.session_manager.clone(),
+            llm_session_manager: self.state.llm_session_manager.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
             log_level_handle: self.state.log_level_handle.clone(),
             extension_manager: self.state.extension_manager.clone(),
             tool_registry: self.state.tool_registry.clone(),
             store: self.state.store.clone(),
+            settings_cache: self.state.settings_cache.clone(),
             job_manager: self.state.job_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
             scheduler: self.state.scheduler.clone(),
@@ -207,6 +220,7 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             llm_provider: self.state.llm_provider.clone(),
+            llm_reload: self.state.llm_reload.clone(),
             skill_registry: self.state.skill_registry.clone(),
             skill_catalog: self.state.skill_catalog.clone(),
             auth_manager: self.state.auth_manager.clone(),
@@ -216,6 +230,7 @@ impl GatewayChannel {
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
             routine_engine: Arc::clone(&self.state.routine_engine),
+            config_toml_path: self.state.config_toml_path.clone(),
             startup_time: self.state.startup_time,
             active_config: self.state.active_config.clone(),
             secrets_store: self.state.secrets_store.clone(),
@@ -251,6 +266,12 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject the LLM session manager for provider reloads.
+    pub fn with_llm_session_manager(mut self, sm: Arc<crate::llm::SessionManager>) -> Self {
+        self.rebuild_state(|s| s.llm_session_manager = Some(sm));
+        self
+    }
+
     /// Inject the log broadcaster for the logs SSE endpoint.
     pub fn with_log_broadcaster(mut self, lb: Arc<LogBroadcaster>) -> Self {
         self.rebuild_state(|s| s.log_broadcaster = Some(lb));
@@ -278,6 +299,14 @@ impl GatewayChannel {
     /// Inject the database store for sandbox job persistence.
     pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
         self.rebuild_state(|s| s.store = Some(store));
+        self
+    }
+
+    pub fn with_settings_cache(
+        mut self,
+        cache: Arc<crate::db::cached_settings::CachedSettingsStore>,
+    ) -> Self {
+        self.rebuild_state(|s| s.settings_cache = Some(cache));
         self
     }
 
@@ -348,6 +377,18 @@ impl GatewayChannel {
         self
     }
 
+    /// Inject the LLM hot-reload controller.
+    pub fn with_llm_reload(mut self, reload: Arc<crate::llm::LlmReloadHandle>) -> Self {
+        self.rebuild_state(|s| s.llm_reload = Some(reload));
+        self
+    }
+
+    /// Inject the TOML config path used when reloading config from DB.
+    pub fn with_config_toml_path(mut self, toml_path: Option<std::path::PathBuf>) -> Self {
+        self.rebuild_state(|s| s.config_toml_path = toml_path);
+        self
+    }
+
     /// Inject registry catalog entries for the available extensions API.
     pub fn with_registry_entries(mut self, entries: Vec<crate::extensions::RegistryEntry>) -> Self {
         self.rebuild_state(|s| s.registry_entries = entries);
@@ -368,7 +409,7 @@ impl GatewayChannel {
 
     /// Inject the active (resolved) configuration snapshot for the status endpoint.
     pub fn with_active_config(mut self, config: server::ActiveConfigSnapshot) -> Self {
-        self.rebuild_state(|s| s.active_config = config);
+        self.rebuild_state(|s| s.active_config = Arc::new(tokio::sync::RwLock::new(config)));
         self
     }
 
@@ -677,7 +718,12 @@ impl Channel for GatewayChannel {
                 message,
                 thread_id: None,
             },
-            StatusUpdate::ImageGenerated { data_url, path } => AppEvent::ImageGenerated {
+            StatusUpdate::ImageGenerated {
+                event_id,
+                data_url,
+                path,
+            } => AppEvent::ImageGenerated {
+                event_id,
                 data_url,
                 path,
                 thread_id: thread_id.clone(),
